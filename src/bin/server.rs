@@ -1,16 +1,34 @@
 use libc::{
     EAGAIN,
+    // = 11 on Linux/macOS
+    // this is what the kernel returns when you try to read/write
+    // on a nonblocking fd that isn't ready yet
+    // means "try again later, nothing here right now"
+
     EINTR,
+    // = 4
+    // means "a system signal interrupted your syscall"
+    // has nothing to do with your data, just retry immediately
+
     F_GETFL,
     F_SETFL,
     O_NONBLOCK,
-    POLLERR,
-    POLLIN,
-    POLLOUT,
+    POLLERR, // 8  -  "tell me when this fd has an error"
+    POLLIN, // 1  -  "tell me when this fd has data to READ"
+    POLLOUT, // 4  -  "tell me when this fd is ready to WRITE"
+    // these are just integer constants defined in C headers
+    // POLLIN as i16 is just casting the integer to the right type
     fcntl,
-    poll,
-    pollfd,
+    poll, // function used for polling
+    pollfd, // struct template (type) for a fd on which the poll is working on
 };
+// pollfd is a STRUCT defined in C as:
+// struct pollfd {
+//     int   fd;      - which file descriptor to watch
+//     short events;  - what you WANT to know about (you set this)
+//     short revents; - what ACTUALLY happened (kernel sets this)
+// }
+// we use it as-is in Rust, same memory layout, same meaning
 
 use std::{ collections::HashMap, io, mem, net::{ TcpListener }, os::unix::io::{ AsRawFd, RawFd } };
 
@@ -46,10 +64,10 @@ impl Conn {
 }
 
 // fcntl - file control - used to get or set the properties of an fd
+// a general-purpose syscall for getting/setting fd properties
 // F_GETFL - get current flags
 // F_SETFL - set new flags
 // O_NONBLOCK - the flag we want to add (makes io non blocking)
-
 fn fd_set_nb(fd: RawFd) {
     unsafe {
         let flags = fcntl(fd, F_GETFL, 0);
@@ -289,6 +307,14 @@ fn main() {
 
         poll_args.push(pollfd { fd: listen_fd, events: POLLIN as i16, revents: 0 });
 
+        /* 
+            listen_fd with POLLIN means:
+            "tell me when a new connection is waiting to be accepted"
+
+            NOT the same as a client fd with POLLIN which means:
+            "tell me when this client sent me data"
+         */
+
         for conn in fd_to_conn.values() {
             let events = match conn.state {
                 State::Req => POLLIN, // waiting for client to send data
@@ -305,21 +331,30 @@ fn main() {
         // 1000ms timeout
         let rv = unsafe { poll(poll_args.as_mut_ptr(), poll_args.len() as libc::nfds_t, 1000) };
 
+        if poll_args[0].revents == 0 {
+            continue;
+        }
+
         if rv < 0 {
             eprintln!("poll() error");
             break;
         }
 
         // collect active fds first to avoid borrow issues
+        // index 1 onwards are client connections
+        // poll_args[1..]  - all active clients
         let active_fds: Vec<RawFd> = poll_args[1..]
             .iter()
-            .filter(|pfd| pfd.revents != 0) // revents = what actually happened
+            .filter(|pfd| pfd.revents != 0)
+            // revents = what actually happened
+            // revents=0 means kernel touched nothing - skip
+            // revents≠0 means kernel wrote something - handle it
             .map(|pfd| pfd.fd)
             .collect();
 
         for fd in active_fds {
             if let Some(conn) = fd_to_conn.get_mut(&fd) {
-                connection_io(conn);
+                connection_io(conn); // real thing happens here
             }
 
             // clean up connections that are done
@@ -339,6 +374,7 @@ fn main() {
 
         // accept new connections if the listening fd is active
         // poll_args[0] is always the listening fd
+        // revents!=0 check for POLLIN "tell me when a new connection is waiting to be accepted"
         if poll_args[0].revents != 0 {
             let conn_fd = unsafe {
                 let mut client_addr: libc::sockaddr_in = mem::zeroed();
