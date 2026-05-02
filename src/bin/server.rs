@@ -123,14 +123,14 @@ fn try_one_request(conn: &mut Conn) -> bool {
 
     // switching to the response state and send
     conn.state = State::Res;
-    state_res(conn); // try_flush_buffer
+    try_flush_buffer(conn);
 
     conn.state == State::Req
 }
 
 //read as much data as possible into buffer from the fd into rbuf
 // stop when we hit EAGAIN ( no more data right now )
-fn try_fill_buffer(conn: &mut Conn) -> bool {
+fn try_fill_buffer(conn: &mut Conn) {
     let mut buf = [0u8; 4096];
 
     loop {
@@ -148,12 +148,12 @@ fn try_fill_buffer(conn: &mut Conn) -> bool {
             if err == EAGAIN {
                 // EAGAIN - no more data right now means we are done for now
                 // poll() will tell us when more will arrive
-                return false;
+                break;
             }
 
             eprintln!("read() error");
             conn.state = State::End;
-            return false;
+            break;
         }
 
         if rv == 0 {
@@ -165,7 +165,7 @@ fn try_fill_buffer(conn: &mut Conn) -> bool {
             }
 
             conn.state = State::End;
-            return false;
+            break;
         }
 
         // append the data to buffer
@@ -173,18 +173,13 @@ fn try_fill_buffer(conn: &mut Conn) -> bool {
 
         while try_one_request(conn) {}
 
-        return conn.state == State::Req;
+        if conn.state != State::Req {
+            break;
+        }
     }
 }
 
-fn state_req(conn: &mut Conn) {
-    // loop try_fill_buffer until it returns false (EAGAIN or state changed)
-    while try_fill_buffer(conn) {}
-    // keep filling as long as there is work to do
-    // stops when EAGAIN or state changes
-}
-
-fn try_flush_buffer(conn: &mut Conn) -> bool {
+fn try_flush_buffer(conn: &mut Conn) {
     loop {
         let remain = &conn.wbuf[conn.wbuf_sent..];
 
@@ -193,7 +188,7 @@ fn try_flush_buffer(conn: &mut Conn) -> bool {
             conn.state = State::Req;
             conn.wbuf.clear();
             conn.wbuf_sent = 0;
-            return false;
+            break;
         }
 
         let rv = unsafe {
@@ -202,15 +197,18 @@ fn try_flush_buffer(conn: &mut Conn) -> bool {
 
         if rv < 0 {
             let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == EINTR {
+                continue;
+            }
             if err == EAGAIN {
                 // kernel write buffer is full right now
                 // poll() will notify us when it drains and we can write more
-                return false;
+                break;
             }
 
             eprintln!("write() error");
             conn.state = State::End;
-            return false;
+            break;
         }
 
         conn.wbuf_sent += rv as usize;
@@ -218,17 +216,11 @@ fn try_flush_buffer(conn: &mut Conn) -> bool {
     }
 }
 
-fn state_res(conn: &mut Conn) {
-    while try_flush_buffer(conn) {}
-    // keep flushing as long as there is data to send
-    // stops when EAGAIN or everything sent
-}
-
 // The state machine dispatcher - called when poll() says this fd is ready
 fn connection_io(conn: &mut Conn) {
     match conn.state {
-        State::Req => state_req(conn),
-        State::Res => state_res(conn),
+        State::Req => try_fill_buffer(conn),
+        State::Res => try_flush_buffer(conn),
         State::End => {}
     }
 }
