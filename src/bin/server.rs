@@ -1,10 +1,10 @@
-use std::{ io::{ ErrorKind, Read, Write }, net::{ TcpListener, TcpStream } };
+use std::{ io::{ BufReader, ErrorKind, Read, Write }, net::{ TcpListener, TcpStream } };
 
 const MAX_MSG: usize = 4096;
-fn one_request(stream: &mut TcpStream) -> Result<(), ()> {
+fn one_request(reader: &mut BufReader<TcpStream>, stream: &mut TcpStream) -> Result<(), ()> {
     // 1. read exac 4 bytes
     let mut header = [0u8; 4];
-    stream.read_exact(&mut header).map_err(|e| {
+    reader.read_exact(&mut header).map_err(|e| {
         if e.kind() == ErrorKind::UnexpectedEof {
             eprintln!("EOF");
         } else {
@@ -22,7 +22,7 @@ fn one_request(stream: &mut TcpStream) -> Result<(), ()> {
 
     //3. read exac len bytes
     let mut body = vec![0u8; len];
-    stream.read_exact(&mut body).map_err(|_| {
+    reader.read_exact(&mut body).map_err(|_| {
         eprintln!("read() error");
     })?;
 
@@ -67,8 +67,11 @@ fn main() {
     for res in listener.incoming() {
         match res {
             Ok(mut conn) => {
+                //internally holds a buffer - default is 8kb
+                //read big chunks from the kernel and then can server reads from memory
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
                 loop {
-                    if one_request(&mut conn).is_err() {
+                    if one_request(&mut reader, &mut conn).is_err() {
                         break;
                     }
                 }
