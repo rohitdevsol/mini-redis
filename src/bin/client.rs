@@ -2,28 +2,22 @@ use std::io::{ ErrorKind, Read, Write };
 use std::net::TcpStream;
 const MAX_MSG: usize = 4096;
 
-fn query(stream: &mut TcpStream, text: &str) -> Result<(), ()> {
-    let text_bytes = text.as_bytes();
-    if text_bytes.len() > MAX_MSG {
-        eprintln!("message is too long");
+fn send_request(stream: &mut TcpStream, text: &str) -> Result<(), ()> {
+    let bytes = text.as_bytes();
+
+    if bytes.len() > MAX_MSG {
         return Err(());
     }
 
-    // building the request
+    let mut wbuf = Vec::new();
+    wbuf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    wbuf.extend_from_slice(bytes);
 
-    let len = text_bytes.len() as u32; // header bnega
-    let mut send_buf = Vec::new();
-    send_buf.extend_from_slice(&len.to_le_bytes()); // header .. length
-    send_buf.extend_from_slice(text_bytes); // actual message
+    stream.write_all(&wbuf).map_err(|_| eprintln!("write error"))?;
+    Ok(())
+}
 
-    // send this
-
-    stream.write_all(&send_buf).map_err(|_| {
-        eprintln!("write() error");
-    })?;
-
-    // now we read the reply
-    // first 4 bytes
+fn read_res(stream: &mut TcpStream) -> Result<(), ()> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).map_err(|e| {
         if e.kind() == ErrorKind::UnexpectedEof {
@@ -49,15 +43,22 @@ fn query(stream: &mut TcpStream, text: &str) -> Result<(), ()> {
     })?;
 
     // print out the message from server
-
     println!("server says : {}", String::from_utf8_lossy(&body));
     Ok(())
 }
 fn main() {
     let mut stream = TcpStream::connect("127.0.0.1:1234").expect("connect() failed");
 
-    query(&mut stream, "hello1").ok();
-    query(&mut stream, "hello2").ok();
-    query(&mut stream, "hello3").ok();
-    // close() - automatic as the stream drops
+    let queries = ["hello1", "hello2", "hello3"];
+    for q in &queries {
+        if send_request(&mut stream, q).is_err() {
+            return;
+        }
+    }
+
+    for _ in &queries {
+        if read_res(&mut stream).is_err() {
+            return;
+        }
+    }
 }
