@@ -1,8 +1,8 @@
-use std::io::{Read, Write, ErrorKind};
+use std::io::{ Read, Write, ErrorKind };
 use std::net::TcpStream;
 use std::thread;
-use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex};
+use std::time::{ Duration, Instant };
+use std::sync::{ Arc, Mutex };
 
 const K_MAX_MSG: usize = 4096;
 const NUM_CONNECTIONS: usize = 10;
@@ -33,9 +33,7 @@ fn send_req(stream: &mut TcpStream, text: &str) -> Result<(), String> {
     wbuf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     wbuf.extend_from_slice(bytes);
 
-    stream
-        .write_all(&wbuf)
-        .map_err(|e| format!("write error: {}", e))
+    stream.write_all(&wbuf).map_err(|e| format!("write error: {}", e))
 }
 
 fn read_res(stream: &mut TcpStream) -> Result<String, String> {
@@ -54,9 +52,7 @@ fn read_res(stream: &mut TcpStream) -> Result<String, String> {
     }
 
     let mut body = vec![0u8; len];
-    stream
-        .read_exact(&mut body)
-        .map_err(|e| format!("read body error: {}", e))?;
+    stream.read_exact(&mut body).map_err(|e| format!("read body error: {}", e))?;
 
     Ok(String::from_utf8_lossy(&body).to_string())
 }
@@ -89,9 +85,7 @@ fn run_connection(conn_id: usize) -> ConnStats {
     };
 
     // set a read timeout so we don't hang forever if server dies
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
     // build messages for this connection
     // each message includes conn_id and message number so we can trace them
@@ -103,7 +97,9 @@ fn run_connection(conn_id: usize) -> ConnStats {
     let send_start = Instant::now();
     for msg in &messages {
         match send_req(&mut stream, msg) {
-            Ok(_) => stats.messages_sent += 1,
+            Ok(_) => {
+                stats.messages_sent += 1;
+            }
             Err(e) => {
                 eprintln!("[conn {}] send error: {}", conn_id, e);
                 stats.failed = true;
@@ -126,10 +122,7 @@ fn run_connection(conn_id: usize) -> ConnStats {
 
                 // verify reply is correct
                 if reply != "world" {
-                    eprintln!(
-                        "[conn {}] msg {} got unexpected reply: {}",
-                        conn_id, i, reply
-                    );
+                    eprintln!("[conn {}] msg {} got unexpected reply: {}", conn_id, i, reply);
                 }
             }
             Err(e) => {
@@ -158,7 +151,8 @@ fn run_connection(conn_id: usize) -> ConnStats {
 
 fn main() {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  Test: {} connections × {} messages = {} total",
+    println!(
+        "  Test: {} connections × {} messages = {} total",
         NUM_CONNECTIONS,
         MSGS_PER_CONNECTION,
         NUM_CONNECTIONS * MSGS_PER_CONNECTION
@@ -214,7 +208,7 @@ fn main() {
     conn_durations.sort_unstable();
 
     let avg_msg_us = if !all_msg_times.is_empty() {
-        all_msg_times.iter().sum::<u128>() / all_msg_times.len() as u128
+        all_msg_times.iter().sum::<u128>() / (all_msg_times.len() as u128)
     } else {
         0
     };
@@ -224,7 +218,7 @@ fn main() {
     let p99 = percentile(&all_msg_times, 99);
 
     let throughput = if overall_elapsed.as_secs_f64() > 0.0 {
-        total_received as f64 / overall_elapsed.as_secs_f64()
+        (total_received as f64) / overall_elapsed.as_secs_f64()
     } else {
         0.0
     };
@@ -258,6 +252,6 @@ fn percentile(sorted: &[u128], pct: usize) -> u128 {
     if sorted.is_empty() {
         return 0;
     }
-    let idx = (sorted.len() * pct / 100).min(sorted.len() - 1);
+    let idx = ((sorted.len() * pct) / 100).min(sorted.len() - 1);
     sorted[idx]
 }

@@ -30,7 +30,7 @@ use libc::{
 // }
 // we use it as-is in Rust, same memory layout, same meaning
 
-use std::{ collections::HashMap, io, mem, net::{ TcpListener }, os::unix::io::{ AsRawFd, RawFd } };
+use std::{ collections::HashMap, io, mem, net::TcpListener, os::unix::io::{ AsRawFd, RawFd } };
 
 const MAX_MSG: usize = 4096;
 
@@ -123,7 +123,7 @@ fn try_one_request(conn: &mut Conn) -> bool {
 
     // switching to the response state and send
     conn.state = State::Res;
-    state_res(conn);
+    state_res(conn); // try_flush_buffer
 
     conn.state == State::Req
 }
@@ -180,6 +180,8 @@ fn try_fill_buffer(conn: &mut Conn) -> bool {
 fn state_req(conn: &mut Conn) {
     // loop try_fill_buffer until it returns false (EAGAIN or state changed)
     while try_fill_buffer(conn) {}
+    // keep filling as long as there is work to do
+    // stops when EAGAIN or state changes
 }
 
 fn try_flush_buffer(conn: &mut Conn) -> bool {
@@ -215,8 +217,11 @@ fn try_flush_buffer(conn: &mut Conn) -> bool {
         // loop and try to write more
     }
 }
+
 fn state_res(conn: &mut Conn) {
     while try_flush_buffer(conn) {}
+    // keep flushing as long as there is data to send
+    // stops when EAGAIN or everything sent
 }
 
 // The state machine dispatcher - called when poll() says this fd is ready
@@ -228,66 +233,6 @@ fn connection_io(conn: &mut Conn) {
     }
 }
 
-// This function-- before we implemented event loop
-
-// fn one_request(reader: &mut BufReader<TcpStream>, stream: &mut TcpStream) -> Result<(), ()> {
-//     // 1. read exac 4 bytes
-//     let mut header = [0u8; 4];
-//     reader.read_exact(&mut header).map_err(|e| {
-//         if e.kind() == ErrorKind::UnexpectedEof {
-//             eprintln!("EOF");
-//         } else {
-//             eprintln!("read() error: {}", e);
-//         }
-//     })?;
-
-//     // 2. now we can parse the remaining
-//     let len = u32::from_le_bytes(header) as usize; // parsing the length here ..  ex 6 0 0 0 becomes 6
-
-//     if len > MAX_MSG {
-//         eprintln!("too long");
-//         return Err(());
-//     }
-
-//     //3. read exac len bytes
-//     let mut body = vec![0u8; len];
-//     reader.read_exact(&mut body).map_err(|_| {
-//         eprintln!("read() error");
-//     })?;
-
-//     // 4. print msg
-//     let msg = String::from_utf8_lossy(&body);
-//     println!("client says: {}", msg);
-
-//     let reply = b"world";
-//     let reply_len = reply.len() as u32;
-
-//     //5. send a reply
-//     // we will also attach the length in begining
-//     let mut reply_buf = Vec::new();
-//     reply_buf.extend_from_slice(&reply_len.to_le_bytes()); // header
-//     reply_buf.extend_from_slice(reply);
-
-//     stream.write_all(&reply_buf).map_err(|_| eprintln!("write() error"))?;
-//     Ok(())
-// }
-
-// fn do_something(mut stream: TcpStream) {
-//     let mut buf = [0u8; 64];
-//     let n = stream.read(&mut buf).unwrap_or_else(|e| {
-//         eprintln!("read() error: {}", e);
-//         0
-//     });
-
-//     if n == 0 {
-//         return;
-//     }
-
-//     let msg = str::from_utf8(&buf[..n]).unwrap_or("invalid utf8");
-//     println!("client says: {}", msg);
-
-//     stream.write_all(b"ha bhai kya hua").unwrap()
-// }
 fn main() {
     let listener = TcpListener::bind("0.0.0.0:1234").expect("failed to bind");
     let listen_fd = listener.as_raw_fd(); // raw fd number
@@ -301,6 +246,17 @@ fn main() {
     let mut poll_args: Vec<pollfd> = Vec::new();
 
     println!("Listening on the port 1234");
+
+    /*
+       Think of poll_args as a whiteboard you show the kernel.
+        Every loop iteration:
+        1. erase the whiteboard        - poll_args.clear()
+        2. write current state on it   - push listen_fd, push all active conns
+        3. show it to the kernel       - poll(poll_args...)
+        4. kernel draws on it          - fills in revents
+        5. you read what kernel drew   - check revents
+        6. go back to step 1
+     */
 
     loop {
         poll_args.clear();
