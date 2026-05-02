@@ -1,47 +1,258 @@
-use std::{ io::{ BufReader, ErrorKind, Read, Write }, net::{ TcpListener, TcpStream } };
+use libc::{
+    EAGAIN,
+    EINTR,
+    F_GETFL,
+    F_SETFL,
+    O_NONBLOCK,
+    POLLERR,
+    POLLIN,
+    POLLOUT,
+    fcntl,
+    poll,
+    pollfd,
+};
+
+use std::{ collections::HashMap, io, mem, net::{ TcpListener }, os::unix::io::{ AsRawFd, RawFd } };
 
 const MAX_MSG: usize = 4096;
-fn one_request(reader: &mut BufReader<TcpStream>, stream: &mut TcpStream) -> Result<(), ()> {
-    // 1. read exac 4 bytes
-    let mut header = [0u8; 4];
-    reader.read_exact(&mut header).map_err(|e| {
-        if e.kind() == ErrorKind::UnexpectedEof {
-            eprintln!("EOF");
-        } else {
-            eprintln!("read() error: {}", e);
+
+#[derive(PartialEq, Clone, Copy)]
+enum State {
+    Req, //currently reading a request
+    Res, //currently writing a response
+    End, //done, close this connection
+}
+
+// every client will get one of these
+struct Conn {
+    fd: RawFd,
+    state: State,
+    rbuf: Vec<u8>, // handles incoming bytes.. grows as the data arrives
+    wbuf: Vec<u8>, // holds the response that is wating to be sent
+
+    wbuf_sent: usize, // how many bytes of the wf are already sent
+}
+
+impl Conn {
+    fn new(fd: RawFd) -> Self {
+        Conn {
+            fd,
+            state: State::Req,
+            rbuf: Vec::new(),
+            wbuf: Vec::new(),
+            wbuf_sent: 0,
         }
-    })?;
+    }
+}
 
-    // 2. now we can parse the remaining
-    let len = u32::from_le_bytes(header) as usize; // parsing the length here ..  ex 6 0 0 0 becomes 6
+// fcntl - file control - used to get or set the properties of an fd
+// F_GETFL - get current flags
+// F_SETFL - set new flags
+// O_NONBLOCK - the flag we want to add (makes io non blocking)
 
-    if len > MAX_MSG {
-        eprintln!("too long");
-        return Err(());
+fn fd_set_nb(fd: RawFd) {
+    unsafe {
+        let flags = fcntl(fd, F_GETFL, 0);
+        if flags < 0 {
+            eprintln!("fcntl F_GETFL error");
+            return;
+        }
+
+        // OR the existing flags with O_NONBLOCK to ADD nonblocking
+        // we don't want to remove other flags , just add this one
+        if fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 {
+            eprintln!("fctnl F_SETFL error");
+        }
+    }
+}
+
+// look at rbuf - do we have a complete request available ?
+// if yes - parse it, generate response into wbuf and remove( drain) it from rbuf
+// If no - return false and wait for more data
+fn try_one_request(conn: &mut Conn) -> bool {
+    // 4 byte for the header
+    if conn.rbuf.len() < 4 {
+        return false; // it means .. not enough data yet come back later
     }
 
-    //3. read exac len bytes
-    let mut body = vec![0u8; len];
-    reader.read_exact(&mut body).map_err(|_| {
-        eprintln!("read() error");
-    })?;
+    let len = u32::from_le_bytes([conn.rbuf[0], conn.rbuf[1], conn.rbuf[2], conn.rbuf[3]]) as usize;
 
-    // 4. print msg
-    let msg = String::from_utf8_lossy(&body);
+    if len > MAX_MSG {
+        eprintln!("message too long");
+        conn.state = State::End;
+        return false;
+    }
+
+    // do we have the full body yet
+    if 4 + len > conn.rbuf.len() {
+        return false; //not enough data , come back later
+    }
+
+    // if we are here then it means we have the complete request
+    let msg = String::from_utf8_lossy(&conn.rbuf[4..4 + len]);
     println!("client says: {}", msg);
 
     let reply = b"world";
     let reply_len = reply.len() as u32;
+    conn.wbuf.clear();
+    conn.wbuf_sent = 0;
+    conn.wbuf.extend_from_slice(&reply_len.to_le_bytes());
+    conn.wbuf.extend_from_slice(reply);
 
-    //5. send a reply
-    // we will also attach the length in begining
-    let mut reply_buf = Vec::new();
-    reply_buf.extend_from_slice(&reply_len.to_le_bytes()); // header
-    reply_buf.extend_from_slice(reply);
+    // remove this request from the rbuf
+    // drain 0..N rmeoves N bytes and shifts the rest to forward
+    conn.rbuf.drain(0..4 + len);
 
-    stream.write_all(&reply_buf).map_err(|_| { eprintln!("write() error") })?;
-    Ok(())
+    // switching to the response state and send
+    conn.state = State::Res;
+    state_res(conn);
+
+    conn.state == State::Req
 }
+
+//read as much data as possible into buffer from the fd into rbuf
+// stop when we hit EAGAIN ( no more data right now )
+fn try_fill_buffer(conn: &mut Conn) -> bool {
+    let mut buf = [0u8; 4096];
+
+    loop {
+        let rv = unsafe { libc::read(conn.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+
+        if rv < 0 {
+            let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+
+            if err == EINTR {
+                // EINTR - interrupted by the a system signal .. we need to retry
+                // not our fault and also not a real error
+                continue;
+            }
+
+            if err == EAGAIN {
+                // EAGAIN - no more data right now means we are done for now
+                // poll() will tell us when more will arrive
+                return false;
+            }
+
+            eprintln!("read() error");
+            conn.state = State::End;
+            return false;
+        }
+
+        if rv == 0 {
+            // 0 bytes = means the client closed the connection
+            if conn.rbuf.is_empty() {
+                eprintln!("EOF");
+            } else {
+                eprintln!("unexpected EOF");
+            }
+
+            conn.state = State::End;
+            return false;
+        }
+
+        // append the data to buffer
+        conn.rbuf.extend_from_slice(&buf[..rv as usize]);
+
+        while try_one_request(conn) {}
+
+        return conn.state == State::Req;
+    }
+}
+
+fn state_req(conn: &mut Conn) {
+    // loop try_fill_buffer until it returns false (EAGAIN or state changed)
+    while try_fill_buffer(conn) {}
+}
+
+fn try_flush_buffer(conn: &mut Conn) -> bool {
+    loop {
+        let remain = &conn.wbuf[conn.wbuf_sent..];
+
+        if remain.is_empty() {
+            // everything send .. now we need to go back to reading
+            conn.state = State::Req;
+            conn.wbuf.clear();
+            conn.wbuf_sent = 0;
+            return false;
+        }
+
+        let rv = unsafe {
+            libc::write(conn.fd, remain.as_ptr() as *const libc::c_void, remain.len())
+        };
+
+        if rv < 0 {
+            let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if err == EAGAIN {
+                // kernel write buffer is full right now
+                // poll() will notify us when it drains and we can write more
+                return false;
+            }
+
+            eprintln!("write() error");
+            conn.state = State::End;
+            return false;
+        }
+
+        conn.wbuf_sent += rv as usize;
+        // loop and try to write more
+    }
+}
+fn state_res(conn: &mut Conn) {
+    while try_flush_buffer(conn) {}
+}
+
+// The state machine dispatcher - called when poll() says this fd is ready
+fn connection_io(conn: &mut Conn) {
+    match conn.state {
+        State::Req => state_req(conn),
+        State::Res => state_res(conn),
+        State::End => {}
+    }
+}
+
+// This function-- before we implemented event loop
+
+// fn one_request(reader: &mut BufReader<TcpStream>, stream: &mut TcpStream) -> Result<(), ()> {
+//     // 1. read exac 4 bytes
+//     let mut header = [0u8; 4];
+//     reader.read_exact(&mut header).map_err(|e| {
+//         if e.kind() == ErrorKind::UnexpectedEof {
+//             eprintln!("EOF");
+//         } else {
+//             eprintln!("read() error: {}", e);
+//         }
+//     })?;
+
+//     // 2. now we can parse the remaining
+//     let len = u32::from_le_bytes(header) as usize; // parsing the length here ..  ex 6 0 0 0 becomes 6
+
+//     if len > MAX_MSG {
+//         eprintln!("too long");
+//         return Err(());
+//     }
+
+//     //3. read exac len bytes
+//     let mut body = vec![0u8; len];
+//     reader.read_exact(&mut body).map_err(|_| {
+//         eprintln!("read() error");
+//     })?;
+
+//     // 4. print msg
+//     let msg = String::from_utf8_lossy(&body);
+//     println!("client says: {}", msg);
+
+//     let reply = b"world";
+//     let reply_len = reply.len() as u32;
+
+//     //5. send a reply
+//     // we will also attach the length in begining
+//     let mut reply_buf = Vec::new();
+//     reply_buf.extend_from_slice(&reply_len.to_le_bytes()); // header
+//     reply_buf.extend_from_slice(reply);
+
+//     stream.write_all(&reply_buf).map_err(|_| eprintln!("write() error"))?;
+//     Ok(())
+// }
 
 // fn do_something(mut stream: TcpStream) {
 //     let mut buf = [0u8; 64];
@@ -61,25 +272,90 @@ fn one_request(reader: &mut BufReader<TcpStream>, stream: &mut TcpStream) -> Res
 // }
 fn main() {
     let listener = TcpListener::bind("0.0.0.0:1234").expect("failed to bind");
+    let listen_fd = listener.as_raw_fd(); // raw fd number
+
+    fd_set_nb(listen_fd);
+
+    // fd -> Conn map
+    let mut fd_to_conn: HashMap<RawFd, Conn> = HashMap::new();
+
+    // poll args - rebuilt every loop iteration
+    let mut poll_args: Vec<pollfd> = Vec::new();
 
     println!("Listening on the port 1234");
 
-    for res in listener.incoming() {
-        match res {
-            Ok(mut conn) => {
-                //internally holds a buffer - default is 8kb
-                //read big chunks from the kernel and then can server reads from memory
-                let mut reader = BufReader::new(conn.try_clone().unwrap());
-                loop {
-                    if one_request(&mut reader, &mut conn).is_err() {
-                        break;
-                    }
-                }
-                // close() automatic when dropped
+    loop {
+        poll_args.clear();
+
+        poll_args.push(pollfd { fd: listen_fd, events: POLLIN as i16, revents: 0 });
+
+        for conn in fd_to_conn.values() {
+            let events = match conn.state {
+                State::Req => POLLIN, // waiting for client to send data
+                State::Res => POLLOUT, // waiting for kernel buffer to drain so we can write
+                State::End => POLLIN, // placeholder.. will be cleaned up
+            };
+
+            poll_args.push(pollfd { fd: conn.fd, events: (events | POLLERR) as i16, revents: 0 });
+        }
+
+        // Blocking call
+        // only place where server blocks
+        // os wakes up when any fd is ready
+        // 1000ms timeout
+        let rv = unsafe { poll(poll_args.as_mut_ptr(), poll_args.len() as libc::nfds_t, 1000) };
+
+        if rv < 0 {
+            eprintln!("poll() error");
+            break;
+        }
+
+        // collect active fds first to avoid borrow issues
+        let active_fds: Vec<RawFd> = poll_args[1..]
+            .iter()
+            .filter(|pfd| pfd.revents != 0) // revents = what actually happened
+            .map(|pfd| pfd.fd)
+            .collect();
+
+        for fd in active_fds {
+            if let Some(conn) = fd_to_conn.get_mut(&fd) {
+                connection_io(conn);
             }
-            Err(e) => {
-                eprintln!("accept() err: {}", e);
-                continue;
+
+            // clean up connections that are done
+            if
+                fd_to_conn
+                    .get(&fd)
+                    .map(|c| c.state == State::End)
+                    .unwrap_or(false)
+            {
+                println!("closing connection fd = {}", fd);
+                fd_to_conn.remove(&fd);
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+        }
+
+        // accept new connections if the listening fd is active
+        // poll_args[0] is always the listening fd
+        if poll_args[0].revents != 0 {
+            let conn_fd = unsafe {
+                let mut client_addr: libc::sockaddr_in = mem::zeroed();
+                let mut socklen = mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+                libc::accept(
+                    listen_fd,
+                    &mut client_addr as *mut _ as *mut libc::sockaddr,
+                    &mut socklen
+                )
+            };
+
+            if conn_fd < 0 {
+                eprintln!("accept() error");
+            } else {
+                fd_set_nb(conn_fd); // CRITICAL - new connections must be nonblocking
+                fd_to_conn.insert(conn_fd, Conn::new(conn_fd));
+                println!("new connection: fd={}", conn_fd);
             }
         }
     }
