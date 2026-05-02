@@ -287,10 +287,6 @@ fn main() {
         // 1000ms timeout
         let rv = unsafe { poll(poll_args.as_mut_ptr(), poll_args.len() as libc::nfds_t, 1000) };
 
-        if poll_args[0].revents == 0 {
-            continue;
-        }
-
         if rv < 0 {
             eprintln!("poll() error");
             break;
