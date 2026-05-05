@@ -30,9 +30,28 @@ use libc::{
 // }
 // we use it as-is in Rust, same memory layout, same meaning
 
-use std::{ collections::HashMap, io, mem, net::TcpListener, os::unix::io::{ AsRawFd, RawFd } };
+use std::{
+    collections::HashMap,
+    io,
+    mem,
+    net::TcpListener,
+    os::unix::io::{ AsRawFd, RawFd },
+    sync::Mutex,
+};
+
+use mini_redis::hashtable::HMap;
 
 const MAX_MSG: usize = 4096;
+
+const RES_OK: u32 = 0;
+const RES_ERR: u32 = 1;
+const RES_NX: u32 = 2; // not exists
+
+const MAX_ARGS: usize = 16;
+
+lazy_static::lazy_static! {
+    static ref G_MAP: Mutex<HMap> = Mutex::new(HMap::new());
+}
 
 #[derive(PartialEq, Clone, Copy)]
 enum State {
@@ -84,6 +103,94 @@ fn fd_set_nb(fd: RawFd) {
     }
 }
 
+// input:  raw bytes of the request body
+// output: Vec<String> of the command parts
+// ["set", "key", "value"]  or  ["get", "key"]  or  ["del", "key"]
+
+fn parse_req(data: &[u8]) -> Option<Vec<String>> {
+    if data.len() < 4 {
+        return None;
+    }
+
+    // number of strings
+    let nstr = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+
+    if nstr > MAX_ARGS {
+        return None;
+    }
+
+    let mut cmd: Vec<String> = Vec::new();
+    let mut pos = 4;
+
+    for _ in 0..nstr {
+        if pos + 4 > data.len() {
+            return None;
+        }
+
+        let sz = u32::from_le_bytes([
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+        ]) as usize;
+
+        pos += 4;
+
+        // need sz more bytes for the string itself
+        if pos + sz > data.len() {
+            return None;
+        }
+        let s = String::from_utf8_lossy(&data[pos..pos + sz]).to_string();
+        cmd.push(s);
+        pos += sz;
+    }
+
+    if pos != data.len() {
+        return None;
+    }
+
+    Some(cmd)
+}
+
+fn do_get(cmd: &[String]) -> (u32, Vec<u8>) {
+    let mut map = G_MAP.lock().unwrap();
+    match map.get(&cmd[1]) {
+        Some(val) => (RES_OK, val.as_bytes().to_vec()),
+        None => (RES_NX, vec![]),
+    }
+}
+
+fn do_del(cmd: &[String]) -> (u32, Vec<u8>) {
+    let mut map = G_MAP.lock().unwrap();
+    if map.del(&cmd[1]) {
+        (RES_OK, vec![])
+    } else {
+        (RES_NX, vec![])
+    }
+}
+
+fn do_set(cmd: &[String]) -> (u32, Vec<u8>) {
+    let mut map = G_MAP.lock().unwrap();
+    map.set(cmd[1].clone(), cmd[2].clone());
+    (RES_OK, vec![])
+}
+fn do_request(req: &[u8]) -> (u32, Vec<u8>) {
+    let cmd = match parse_req(req) {
+        Some(c) => c,
+        None => {
+            eprintln!("bad request");
+            return (RES_ERR, b"bad request".to_vec());
+        }
+    };
+
+    match (cmd[0].to_lowercase().as_str(), cmd.len()) {
+        ("get", 2) => do_get(&cmd),
+        ("set", 3) => do_set(&cmd),
+        ("del", 2) => do_del(&cmd),
+        _ => { (RES_ERR, b"unknown cmd".to_vec()) }
+    }
+}
+
 // look at rbuf - do we have a complete request available ?
 // if yes - parse it, generate response into wbuf and remove( drain) it from rbuf
 // If no - return false and wait for more data
@@ -107,15 +214,15 @@ fn try_one_request(conn: &mut Conn) -> bool {
     }
 
     // if we are here then it means we have the complete request
-    let msg = String::from_utf8_lossy(&conn.rbuf[4..4 + len]);
-    println!("client says: {}", msg);
+    let req_body = &conn.rbuf[4..4 + len];
+    let (rescode, data) = do_request(req_body);
+    let resp_len = 4 + (data.len() as u32);
 
-    let reply = b"world";
-    let reply_len = reply.len() as u32;
     conn.wbuf.clear();
     conn.wbuf_sent = 0;
-    conn.wbuf.extend_from_slice(&reply_len.to_le_bytes());
-    conn.wbuf.extend_from_slice(reply);
+    conn.wbuf.extend_from_slice(&resp_len.to_le_bytes());
+    conn.wbuf.extend_from_slice(&rescode.to_le_bytes());
+    conn.wbuf.extend_from_slice(&data);
 
     // remove this request from the rbuf
     // drain 0..N rmeoves N bytes and shifts the rest to forward
