@@ -229,6 +229,32 @@ impl HMap {
         }
         self.ht2.lookup(key, hcode).map(|e| e.val.clone())
     }
+
+    // returns all keys from both tables
+    // used by the keys command
+    pub fn all_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+
+        // walk ht1
+        for bucket in &self.ht1.buckets {
+            let mut current = bucket.as_ref();
+            while let Some(node) = current {
+                keys.push(node.entry.key.clone());
+                current = node.next.as_ref();
+            }
+        }
+
+        // walk ht2 (might have keys during resize)
+        for bucket in &self.ht2.buckets {
+            let mut current = bucket.as_ref();
+            while let Some(node) = current {
+                keys.push(node.entry.key.clone());
+                current = node.next.as_ref();
+            }
+        }
+
+        keys
+    }
     // mirrors hm_insert
     pub fn set(&mut self, key: String, val: String) {
         self.help_resizing();

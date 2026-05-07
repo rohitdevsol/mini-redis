@@ -42,12 +42,17 @@ use std::{
 use mini_redis::hashtable::HMap;
 
 const MAX_MSG: usize = 4096;
-
-const RES_OK: u32 = 0;
-const RES_ERR: u32 = 1;
-const RES_NX: u32 = 2; // not exists
-
 const MAX_ARGS: usize = 16;
+
+const SER_NIL: u8 = 0;
+const SER_ERR: u8 = 1;
+const SER_STR: u8 = 2;
+const SER_INT: u8 = 3;
+const SER_ARR: u8 = 4;
+
+// error codes
+const ERR_UNKNOWN: i32 = 1;
+const ERR_2BIG: i32 = 2;
 
 lazy_static::lazy_static! {
     static ref G_MAP: Mutex<HMap> = Mutex::new(HMap::new());
@@ -80,6 +85,41 @@ impl Conn {
             wbuf_sent: 0,
         }
     }
+}
+
+fn out_nil(out: &mut Vec<u8>) {
+    out.push(SER_NIL);
+    // that is it. one byte.
+}
+
+fn out_str(out: &mut Vec<u8>, val: &str) {
+    out.push(SER_STR);
+    // 4 byte length
+    out.extend_from_slice(&(val.len() as u32).to_le_bytes());
+    // actual string bytes
+    out.extend_from_slice(val.as_bytes());
+}
+
+fn out_int(out: &mut Vec<u8>, val: i64) {
+    out.push(SER_INT);
+    // 8 bytes for i64
+    out.extend_from_slice(&val.to_le_bytes());
+}
+
+fn out_err(out: &mut Vec<u8>, code: i32, msg: &str) {
+    out.push(SER_ERR);
+    // 4 bytes error code
+    out.extend_from_slice(&code.to_le_bytes());
+    // 4 bytes message length
+    out.extend_from_slice(&(msg.len() as u32).to_le_bytes());
+    // message bytes
+    out.extend_from_slice(msg.as_bytes());
+}
+
+fn out_arr(out: &mut Vec<u8>, count: u32) {
+    out.push(SER_ARR);
+    // just the count — elements are appended separately after this
+    out.extend_from_slice(&count.to_le_bytes());
 }
 
 // fcntl - file control - used to get or set the properties of an fd
@@ -152,42 +192,46 @@ fn parse_req(data: &[u8]) -> Option<Vec<String>> {
     Some(cmd)
 }
 
-fn do_get(cmd: &[String]) -> (u32, Vec<u8>) {
+fn do_get(cmd: &[String], out: &mut Vec<u8>) {
     let mut map = G_MAP.lock().unwrap();
     match map.get(&cmd[1]) {
-        Some(val) => (RES_OK, val.as_bytes().to_vec()),
-        None => (RES_NX, vec![]),
+        Some(val) => out_str(out, &val.clone()),
+        None => out_nil(out),
+        // nil instead of RES_NX now — cleaner
     }
 }
 
-fn do_del(cmd: &[String]) -> (u32, Vec<u8>) {
+fn do_del(cmd: &[String], out: &mut Vec<u8>) {
     let mut map = G_MAP.lock().unwrap();
-    if map.del(&cmd[1]) {
-        (RES_OK, vec![])
-    } else {
-        (RES_NX, vec![])
-    }
+    let deleted = map.del(&cmd[1]);
+    // returns integer 1 if deleted, 0 if key was not there
+    out_int(out, if deleted { 1 } else { 0 });
 }
 
-fn do_set(cmd: &[String]) -> (u32, Vec<u8>) {
+fn do_set(cmd: &[String], out: &mut Vec<u8>) {
     let mut map = G_MAP.lock().unwrap();
     map.set(cmd[1].clone(), cmd[2].clone());
-    (RES_OK, vec![])
+    out_nil(out); // set always returns nil
 }
-fn do_request(req: &[u8]) -> (u32, Vec<u8>) {
-    let cmd = match parse_req(req) {
-        Some(c) => c,
-        None => {
-            eprintln!("bad request");
-            return (RES_ERR, b"bad request".to_vec());
-        }
-    };
 
+fn do_keys(out: &mut Vec<u8>) {
+    let map = G_MAP.lock().unwrap();
+    let keys: Vec<String> = map.all_keys();
+    // first write the array header with the count
+    out_arr(out, keys.len() as u32);
+    // then write each key as a serialized string
+    // each one is a full SER_STR value, type byte included
+    for key in &keys {
+        out_str(out, key);
+    }
+}
+fn do_request(cmd: &[String], out: &mut Vec<u8>) {
     match (cmd[0].to_lowercase().as_str(), cmd.len()) {
-        ("get", 2) => do_get(&cmd),
-        ("set", 3) => do_set(&cmd),
-        ("del", 2) => do_del(&cmd),
-        _ => { (RES_ERR, b"unknown cmd".to_vec()) }
+        ("keys", 1) => do_keys(out),
+        ("get", 2) => do_get(cmd, out),
+        ("set", 3) => do_set(cmd, out),
+        ("del", 2) => do_del(cmd, out),
+        _ => out_err(out, ERR_UNKNOWN, "Unknown cmd"),
     }
 }
 
@@ -214,15 +258,29 @@ fn try_one_request(conn: &mut Conn) -> bool {
     }
 
     // if we are here then it means we have the complete request
-    let req_body = &conn.rbuf[4..4 + len];
-    let (rescode, data) = do_request(req_body);
-    let resp_len = 4 + (data.len() as u32);
+    let req_body = &conn.rbuf[4..4 + len].to_vec();
+    let cmd = match parse_req(&req_body) {
+        Some(c) => c,
+        None => {
+            eprintln!("bad request");
+            conn.state = State::End;
+            return false;
+        }
+    };
+
+    let mut out: Vec<u8> = Vec::new();
+    do_request(&cmd, &mut out);
+
+    // check response is not too big
+    if out.len() > MAX_MSG {
+        out.clear();
+        out_err(&mut out, ERR_2BIG, "response is too big");
+    }
 
     conn.wbuf.clear();
     conn.wbuf_sent = 0;
-    conn.wbuf.extend_from_slice(&resp_len.to_le_bytes());
-    conn.wbuf.extend_from_slice(&rescode.to_le_bytes());
-    conn.wbuf.extend_from_slice(&data);
+    conn.wbuf.extend_from_slice(&(out.len() as u32).to_le_bytes());
+    conn.wbuf.extend_from_slice(&out);
 
     // remove this request from the rbuf
     // drain 0..N rmeoves N bytes and shifts the rest to forward

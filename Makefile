@@ -12,7 +12,6 @@ client:
 test:
 	cargo run --bin test_client
 
-
 get:
 	cargo run --bin client -- get $(k)
 
@@ -22,6 +21,8 @@ set:
 del:
 	cargo run --bin client -- del $(k)
 
+keys:
+	cargo run --bin client -- keys
 
 clean:
 	cargo clean
