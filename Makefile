@@ -24,5 +24,8 @@ del:
 keys:
 	cargo run --bin client -- keys
 
+test_avl:
+	cargo run --bin test_avl
+
 clean:
 	cargo clean
